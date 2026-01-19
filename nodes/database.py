@@ -333,3 +333,150 @@ class DatabaseNode:
                         context_parts.append(f"  Pronouns: {char['metadata']['pronouns']}")
 
         return "\n".join(context_parts) if context_parts else "No specific context available."
+
+    # ===========================================
+    # Episode Blueprint Operations
+    # ===========================================
+
+    def get_episode_blueprint(self, project_id: int, episode_number: int) -> Optional[Dict[str, Any]]:
+        """Get blueprint for a specific episode"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM episode_blueprints
+                    WHERE project_id = %s AND episode_number = %s
+                """, (project_id, episode_number))
+                result = cur.fetchone()
+                return dict(result) if result else None
+
+    def get_all_episode_blueprints(self, project_id: int) -> List[Dict[str, Any]]:
+        """Get all episode blueprints for a project"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM episode_blueprints
+                    WHERE project_id = %s
+                    ORDER BY episode_number
+                """, (project_id,))
+                return [dict(row) for row in cur.fetchall()]
+
+    def get_episodes_by_arc(self, project_id: int, arc_number: int) -> List[Dict[str, Any]]:
+        """Get all episodes in a specific arc"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM episode_blueprints
+                    WHERE project_id = %s AND arc_number = %s
+                    ORDER BY episode_number
+                """, (project_id, arc_number))
+                return [dict(row) for row in cur.fetchall()]
+
+    def search_episode_blueprints(
+        self,
+        project_id: int,
+        query: str,
+        limit: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Search episode blueprints using vector similarity"""
+        query_embedding = self.embedding_model.encode(query).tolist()
+
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, episode_number, title, tone, selling_points,
+                           scene_structure, cliffhanger,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM episode_blueprints
+                    WHERE project_id = %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (query_embedding, project_id, query_embedding, limit))
+                return [dict(row) for row in cur.fetchall()]
+
+    def build_episode_context(
+        self,
+        project_id: int,
+        episode_number: int
+    ) -> Dict[str, Any]:
+        """
+        Build complete context for writing an episode
+
+        Returns dict with:
+        - blueprint: Episode blueprint details
+        - characters: Characters involved in this episode
+        - previous_episodes: Summary of previous episodes
+        - world_context: Relevant world knowledge
+        """
+        context = {
+            'blueprint': None,
+            'characters': [],
+            'previous_episodes': [],
+            'world_context': ""
+        }
+
+        # Get episode blueprint
+        blueprint = self.get_episode_blueprint(project_id, episode_number)
+        if blueprint:
+            context['blueprint'] = blueprint
+
+            # Get characters involved
+            if blueprint.get('characters_involved'):
+                for char_name in blueprint['characters_involved']:
+                    char_info = self.search_world_knowledge(
+                        project_id, char_name, category='character', limit=1
+                    )
+                    if char_info:
+                        context['characters'].extend(char_info)
+
+            # Build world context from scene structure
+            if blueprint.get('scene_structure'):
+                context['world_context'] = self.build_context_for_scene(
+                    project_id,
+                    blueprint['scene_structure'],
+                    include_characters=True
+                )
+
+        # Get previous episodes
+        if episode_number > 1:
+            context['previous_episodes'] = self.get_previous_chapters(
+                project_id, episode_number, limit=2
+            )
+
+        return context
+
+    def get_project_progress(self, project_id: int) -> Dict[str, Any]:
+        """Get project writing progress"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Get total blueprints
+                cur.execute("""
+                    SELECT COUNT(*) as total_episodes FROM episode_blueprints
+                    WHERE project_id = %s
+                """, (project_id,))
+                total = cur.fetchone()['total_episodes']
+
+                # Get completed chapters
+                cur.execute("""
+                    SELECT COUNT(*) as completed_chapters FROM chapters
+                    WHERE project_id = %s
+                """, (project_id,))
+                completed = cur.fetchone()['completed_chapters']
+
+                # Get next episode to write
+                cur.execute("""
+                    SELECT eb.episode_number, eb.title
+                    FROM episode_blueprints eb
+                    LEFT JOIN chapters c ON eb.project_id = c.project_id
+                        AND eb.episode_number = c.chapter_number
+                    WHERE eb.project_id = %s AND c.id IS NULL
+                    ORDER BY eb.episode_number
+                    LIMIT 1
+                """, (project_id,))
+                next_ep = cur.fetchone()
+
+                return {
+                    'total_episodes': total,
+                    'completed_chapters': completed,
+                    'progress_percent': round((completed / total * 100) if total > 0 else 0, 1),
+                    'next_episode': dict(next_ep) if next_ep else None
+                }

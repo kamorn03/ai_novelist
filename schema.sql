@@ -61,6 +61,32 @@ CREATE TABLE IF NOT EXISTS kpi_logs (
 );
 
 -- ===========================================
+-- Table: episode_blueprints
+-- Detailed blueprint for each episode
+-- ===========================================
+CREATE TABLE IF NOT EXISTS episode_blueprints (
+    id SERIAL PRIMARY KEY,
+    project_id INT REFERENCES projects(id) ON DELETE CASCADE,
+    episode_number INT NOT NULL,
+    title VARCHAR(255),
+    price_tier VARCHAR(50) DEFAULT 'normal',  -- 'free', 'normal', 'premium', 'special'
+    price_coins INT DEFAULT 0,
+    intimacy_level VARCHAR(10) DEFAULT 'L1',  -- 'L1', 'L2', 'L3', 'L4', 'L5'
+    characters_involved TEXT[],               -- Array of character names
+    tone VARCHAR(255),                        -- e.g., 'ตลก โรแมนติก'
+    selling_points TEXT,                      -- จุดขาย
+    cliffhanger TEXT,                         -- Cliffhanger description
+    scene_structure TEXT,                     -- Scene 1, Scene 2... structure
+    notes TEXT,                               -- Additional notes
+    arc_number INT DEFAULT 1,                 -- Which story arc (1-4)
+    arc_name VARCHAR(255),                    -- Arc name
+    embedding vector(384),                    -- For semantic search
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, episode_number)
+);
+
+-- ===========================================
 -- Table: world_knowledge (Vector RAG)
 -- Character profiles, settings, plot points
 -- ===========================================
@@ -88,6 +114,12 @@ CREATE INDEX IF NOT EXISTS idx_world_knowledge_category ON world_knowledge(proje
 CREATE INDEX IF NOT EXISTS idx_world_knowledge_embedding
 ON world_knowledge USING hnsw (embedding vector_cosine_ops);
 
+-- Episode blueprints indexes
+CREATE INDEX IF NOT EXISTS idx_episode_blueprints_project ON episode_blueprints(project_id);
+CREATE INDEX IF NOT EXISTS idx_episode_blueprints_episode ON episode_blueprints(project_id, episode_number);
+CREATE INDEX IF NOT EXISTS idx_episode_blueprints_embedding
+ON episode_blueprints USING hnsw (embedding vector_cosine_ops);
+
 -- ===========================================
 -- Helper function to update timestamps
 -- ===========================================
@@ -113,4 +145,9 @@ CREATE TRIGGER trigger_chapters_updated
 DROP TRIGGER IF EXISTS trigger_world_knowledge_updated ON world_knowledge;
 CREATE TRIGGER trigger_world_knowledge_updated
     BEFORE UPDATE ON world_knowledge
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+DROP TRIGGER IF EXISTS trigger_episode_blueprints_updated ON episode_blueprints;
+CREATE TRIGGER trigger_episode_blueprints_updated
+    BEFORE UPDATE ON episode_blueprints
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();

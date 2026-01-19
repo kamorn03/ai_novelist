@@ -41,46 +41,60 @@ class PlannerNode:
         self.chain = self.prompt_template | self.llm | StrOutputParser()
 
     def _get_system_prompt(self) -> str:
-        return """You are a professional novel plot architect and scene planner.
+        return """You are a professional Thai novel plot architect and scene planner.
 
-Your role is to create detailed, actionable scene instructions in English that will guide a creative writer to produce high-quality prose.
+Your role is to create detailed, actionable scene instructions in English that will guide a creative writer to produce high-quality Thai prose.
 
-For each scene, you must provide:
+You will receive a BLUEPRINT for each episode that contains:
+- Scene structure (Scene 1, Scene 2, etc.)
+- Characters involved
+- Tone and mood
+- Selling points (key moments readers want)
+- Cliffhanger requirement
+- Intimacy level guidelines
 
-1. **Scene Overview**: A brief summary of what happens (2-3 sentences)
+Your job is to EXPAND this blueprint into detailed writing instructions.
+
+For each scene in the episode, provide:
+
+1. **Scene Overview**: What happens (2-3 sentences)
 
 2. **Setting Details**:
    - Time of day
    - Location description
    - Atmosphere/mood
-   - Sensory details to include (sights, sounds, smells)
+   - Sensory details (sights, sounds, smells)
 
 3. **Characters Present**:
-   - List all characters in the scene
+   - List all characters
    - Their emotional states
-   - Their goals/motivations in this scene
+   - Their goals in this scene
 
 4. **Key Dialogue Points**:
-   - Important conversations that must occur
-   - Tone of dialogue (formal, intimate, tense, etc.)
-   - Any specific phrases or revelations
+   - Important conversations
+   - Tone of dialogue
+   - Specific revelations or phrases
 
 5. **Action Beats**:
-   - Numbered list of events in order
-   - Physical actions and movements
-   - Internal thoughts to convey
+   - Numbered list of events
+   - Physical actions
+   - Internal thoughts to show
 
-6. **Emotional Arc**:
-   - How should the reader feel at the start?
-   - How should the reader feel at the end?
-   - Key emotional turning points
+6. **Intimacy Guidelines** (if applicable):
+   - Level of physical description allowed
+   - What to show vs imply
+   - Emotional focus
 
-7. **Narrative Style Notes**:
-   - Pacing (fast/slow)
-   - Point of view
-   - Any specific literary devices to employ
+7. **Emotional Arc**:
+   - Reader feeling at start
+   - Reader feeling at end
+   - Key turning points
 
-Be specific and detailed. The writer will use these instructions to create prose in Thai, so clarity is essential."""
+8. **Cliffhanger Setup**:
+   - How to build tension toward the cliffhanger
+   - Exact ending moment
+
+Be specific and detailed. The writer will use these instructions to create prose in Thai."""
 
     def plan_scene(
         self,
@@ -157,6 +171,116 @@ Style: Modern Thai (ไทยสมัยใหม่)
 """
         }
         return style_descriptions.get(style, style_descriptions["modern_thai"])
+
+    def plan_from_blueprint(
+        self,
+        blueprint: dict,
+        characters: list,
+        previous_context: str = "",
+        style: str = "modern_thai"
+    ) -> str:
+        """
+        Generate scene instructions from episode blueprint
+
+        Args:
+            blueprint: Episode blueprint dict from database
+            characters: List of character info dicts
+            previous_context: Summary of previous episodes
+            style: Writing style
+
+        Returns:
+            Detailed English scene instructions
+        """
+        # Format characters info
+        char_info = ""
+        if characters:
+            char_info = "\n".join([
+                f"- {c.get('name', 'Unknown')}: {c.get('description', '')} "
+                f"(Role: {c.get('metadata', {}).get('role', 'unknown')})"
+                for c in characters
+            ])
+
+        # Get intimacy level guidelines
+        intimacy_guidelines = self._get_intimacy_guidelines(blueprint.get('intimacy_level', 'L1'))
+
+        input_text = f"""Please create detailed scene instructions for Episode {blueprint.get('episode_number', 1)}.
+
+## Episode Blueprint
+**Title:** {blueprint.get('title', 'Untitled')}
+**Arc:** {blueprint.get('arc_name', '')} (Arc {blueprint.get('arc_number', 1)})
+**Tone:** {blueprint.get('tone', 'Not specified')}
+**Selling Points:** {blueprint.get('selling_points', 'Not specified')}
+**Cliffhanger:** {blueprint.get('cliffhanger', 'Not specified')}
+**Intimacy Level:** {blueprint.get('intimacy_level', 'L1')}
+
+## Scene Structure from Blueprint
+{blueprint.get('scene_structure', 'No structure provided')}
+
+## Notes
+{blueprint.get('notes', 'No additional notes')}
+
+## Characters in This Episode
+{char_info if char_info else 'No specific characters listed'}
+
+## Writing Style
+{self._get_style_description(style)}
+
+## Intimacy Level Guidelines
+{intimacy_guidelines}
+
+## Previous Episode Context
+{previous_context if previous_context else "This is the first episode or no previous context available."}
+
+---
+
+Based on this blueprint, create comprehensive scene-by-scene instructions.
+IMPORTANT:
+1. Follow the scene structure exactly as given
+2. Include the cliffhanger at the end
+3. Respect the intimacy level guidelines
+4. Capture the specified tone throughout
+5. Make sure the selling points are featured prominently
+"""
+
+        result = self.chain.invoke({"input": input_text})
+        return result
+
+    def _get_intimacy_guidelines(self, level: str) -> str:
+        """Get writing guidelines for intimacy level"""
+        guidelines = {
+            "L1": """Level 1 - Eye contact and conversation only
+- Focus on dialogue and emotional tension
+- Describe looks, glances, subtle body language
+- No physical contact beyond incidental
+- Build romantic tension through words and atmosphere""",
+
+            "L2": """Level 2 - Symbolic touch (holding hands, hugging)
+- Can include hand-holding, hugs, light touches
+- Describe the emotional impact of touches
+- Keep physical descriptions tasteful
+- Focus on the emotional significance""",
+
+            "L3": """Level 3 - Closer intimacy (kissing, implied sleeping together)
+- Can include kissing scenes with moderate detail
+- Sleeping together should be IMPLIED, not explicit
+- Use phrases like "that night..." or "she didn't go back to her room"
+- Focus on emotional aftermath""",
+
+            "L4": """Level 4 - Soft explicit (implied NC with some detail)
+- Can describe the lead-up and aftermath
+- Use suggestive language but not graphic
+- Focus on emotions and sensations over mechanics
+- Can mention clothing removal, positions implied
+- Cut away at key moments or use metaphorical language""",
+
+            "L5": """Level 5 - Explicit (full NC description)
+- Can include detailed intimate scenes
+- Describe physical sensations and actions
+- Maintain literary quality - not crude
+- Balance explicit content with emotional depth
+- Include dialogue and emotional reactions"""
+        }
+        return guidelines.get(level, guidelines["L1"])
 
     def refine_instructions(
         self,

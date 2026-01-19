@@ -92,7 +92,7 @@ Your task is to evaluate Thai prose based on three criteria, scoring each from 0
 
 You MUST respond in this exact JSON format:
 ```json
-{
+{{
     "consistency_score": <number 0-10>,
     "consistency_reasoning": "<explanation>",
     "prose_quality_score": <number 0-10>,
@@ -101,7 +101,7 @@ You MUST respond in this exact JSON format:
     "emotional_reasoning": "<explanation>",
     "overall_feedback": "<summary of main issues and strengths>",
     "suggestions": ["<specific suggestion 1>", "<specific suggestion 2>", ...]
-}
+}}
 ```
 
 Be constructive but honest. If the prose has issues, clearly identify them.
