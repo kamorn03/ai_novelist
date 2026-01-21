@@ -480,3 +480,229 @@ class DatabaseNode:
                     'progress_percent': round((completed / total * 100) if total > 0 else 0, 1),
                     'next_episode': dict(next_ep) if next_ep else None
                 }
+
+    # ===========================================
+    # Few-Shot Learning Operations
+    # ===========================================
+
+    def add_few_shot_example(
+        self,
+        example_type: str,
+        style: str,
+        input_context: str,
+        output_example: str,
+        project_id: Optional[int] = None,
+        source_chapter_id: Optional[int] = None,
+        quality_scores: Optional[Dict[str, float]] = None
+    ) -> int:
+        """
+        Add a few-shot example to the database
+
+        Args:
+            example_type: 'writer', 'planner', or 'refiner'
+            style: Writing style
+            input_context: The input prompt/context
+            output_example: The high-quality output
+            project_id: Optional project association
+            source_chapter_id: Optional source chapter
+            quality_scores: Dict with 'average', 'consistency', 'prose', 'emotional'
+
+        Returns:
+            ID of created example
+        """
+        # Generate embedding for semantic search
+        embedding_text = f"{input_context[:500]}"  # Use input for similarity
+        embedding = self.embedding_model.encode(embedding_text).tolist()
+
+        # Extract quality scores
+        quality_score = quality_scores.get('average', 0.0) if quality_scores else 0.0
+        kpi_consistency = quality_scores.get('consistency', 0.0) if quality_scores else 0.0
+        kpi_prose = quality_scores.get('prose', 0.0) if quality_scores else 0.0
+        kpi_emotional = quality_scores.get('emotional', 0.0) if quality_scores else 0.0
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO few_shot_examples
+                    (project_id, example_type, style, input_context, output_example,
+                     source_chapter_id, quality_score, kpi_consistency, kpi_prose,
+                     kpi_emotional, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    project_id, example_type, style, input_context, output_example,
+                    source_chapter_id, quality_score, kpi_consistency, kpi_prose,
+                    kpi_emotional, embedding
+                ))
+                example_id = cur.fetchone()[0]
+
+        print(f"[DB] Added few-shot example (ID: {example_id}, type: {example_type}, score: {quality_score})")
+        return example_id
+
+    def get_few_shot_examples(
+        self,
+        example_type: str,
+        style: str,
+        query_context: Optional[str] = None,
+        limit: int = 3,
+        min_quality: float = 8.0
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve relevant few-shot examples
+
+        Args:
+            example_type: 'writer', 'planner', or 'refiner'
+            style: Writing style to match
+            query_context: Optional context for semantic search
+            limit: Maximum number of examples to retrieve
+            min_quality: Minimum quality score threshold
+
+        Returns:
+            List of example dicts with input_context and output_example
+        """
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if query_context:
+                    # Semantic search
+                    query_embedding = self.embedding_model.encode(query_context).tolist()
+                    cur.execute("""
+                        SELECT id, input_context, output_example, quality_score,
+                               1 - (embedding <=> %s::vector) AS similarity
+                        FROM few_shot_examples
+                        WHERE example_type = %s
+                          AND style = %s
+                          AND is_active = TRUE
+                          AND quality_score >= %s
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                    """, (
+                        query_embedding, example_type, style, min_quality,
+                        query_embedding, limit
+                    ))
+                else:
+                    # Just get top quality examples
+                    cur.execute("""
+                        SELECT id, input_context, output_example, quality_score
+                        FROM few_shot_examples
+                        WHERE example_type = %s
+                          AND style = %s
+                          AND is_active = TRUE
+                          AND quality_score >= %s
+                        ORDER BY quality_score DESC, usage_count ASC
+                        LIMIT %s
+                    """, (example_type, style, min_quality, limit))
+
+                examples = [dict(row) for row in cur.fetchall()]
+
+                # Update usage tracking
+                if examples:
+                    example_ids = [ex['id'] for ex in examples]
+                    cur.execute("""
+                        UPDATE few_shot_examples
+                        SET usage_count = usage_count + 1,
+                            last_used_at = CURRENT_TIMESTAMP
+                        WHERE id = ANY(%s)
+                    """, (example_ids,))
+
+                return examples
+
+    def auto_collect_few_shot_example(
+        self,
+        project_id: int,
+        chapter_number: int,
+        min_quality_threshold: float = 8.0
+    ) -> Optional[int]:
+        """
+        Auto-collect few-shot example from a high-quality chapter
+
+        Args:
+            project_id: Project ID
+            chapter_number: Chapter number
+            min_quality_threshold: Minimum score to auto-collect
+
+        Returns:
+            ID of created example, or None if quality too low
+        """
+        # Get chapter
+        chapter = self.get_chapter(project_id, chapter_number)
+        if not chapter:
+            return None
+
+        # Check if final score meets threshold
+        final_score = chapter.get('final_score', 0.0)
+        if final_score < min_quality_threshold:
+            return None
+
+        # Get the best KPI log for this chapter
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT *
+                    FROM kpi_logs
+                    WHERE project_id = %s
+                      AND chapter_number = %s
+                      AND is_passed = TRUE
+                    ORDER BY average_score DESC
+                    LIMIT 1
+                """, (project_id, chapter_number))
+                kpi_log = cur.fetchone()
+
+        if not kpi_log:
+            return None
+
+        # Get project style
+        project = self.get_project(project_id)
+        if not project:
+            return None
+
+        style = project.get('style', 'modern_thai')
+
+        # Create few-shot example for writer
+        quality_scores = {
+            'average': kpi_log['average_score'],
+            'consistency': kpi_log['consistency_score'],
+            'prose': kpi_log['prose_quality_score'],
+            'emotional': kpi_log['emotional_score']
+        }
+
+        example_id = self.add_few_shot_example(
+            example_type='writer',
+            style=style,
+            input_context=chapter['scene_instructions'],
+            output_example=chapter['content'],
+            project_id=project_id,
+            source_chapter_id=chapter['id'],
+            quality_scores=quality_scores
+        )
+
+        print(f"[DB] Auto-collected few-shot example from chapter {chapter_number} (score: {final_score})")
+        return example_id
+
+    def get_few_shot_stats(self, example_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get statistics about few-shot examples"""
+        with self.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if example_type:
+                    cur.execute("""
+                        SELECT
+                            COUNT(*) as total_examples,
+                            AVG(quality_score) as avg_quality,
+                            MAX(quality_score) as max_quality,
+                            MIN(quality_score) as min_quality,
+                            SUM(usage_count) as total_usage
+                        FROM few_shot_examples
+                        WHERE example_type = %s AND is_active = TRUE
+                    """, (example_type,))
+                else:
+                    cur.execute("""
+                        SELECT
+                            example_type,
+                            COUNT(*) as total_examples,
+                            AVG(quality_score) as avg_quality,
+                            SUM(usage_count) as total_usage
+                        FROM few_shot_examples
+                        WHERE is_active = TRUE
+                        GROUP BY example_type
+                    """)
+
+                return [dict(row) for row in cur.fetchall()]

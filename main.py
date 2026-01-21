@@ -6,6 +6,11 @@ import os
 import sys
 from typing import Literal
 
+# Fix Windows console encoding for Thai characters
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -20,8 +25,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from state import NovelState, create_initial_state, KPIReport, STYLE_GUIDES
 from nodes.database import DatabaseNode
 from nodes.planner import PlannerNode
-from nodes.writer import WriterNode
+from nodes.writer import WriterNode, ClaudeWriterNode
 from nodes.evaluator import EvaluatorNode
+from nodes.refiner import RefinerNode
 
 load_dotenv()
 
@@ -96,7 +102,8 @@ def planner_node(state: NovelState) -> NovelState:
             blueprint=blueprint,
             characters=episode_context['characters'],
             previous_context=previous_context,
-            style=state["style"]
+            style=state["style"],
+            project_id=state["project_id"]
         )
 
         # Store additional context
@@ -135,11 +142,14 @@ def planner_node(state: NovelState) -> NovelState:
 
 
 def writer_node(state: NovelState) -> NovelState:
-    """Write the Thai prose"""
+    """Write the Thai prose using Claude (primary) or Ollama (fallback)"""
     iteration = state["iteration_count"] + 1
-    console.print(f"\n[bold cyan]Writing Thai prose (Iteration {iteration})...[/bold cyan]")
+    use_claude = state.get("use_claude", True) and os.getenv("USE_CLAUDE_WRITER", "true").lower() == "true"
 
-    writer = WriterNode()
+    if use_claude:
+        console.print(f"\n[bold cyan]Writing Thai prose with Claude (Iteration {iteration})...[/bold cyan]")
+    else:
+        console.print(f"\n[bold cyan]Writing Thai prose with Ollama (Iteration {iteration})...[/bold cyan]")
 
     # Get feedback if rewriting
     previous_feedback = ""
@@ -148,18 +158,72 @@ def writer_node(state: NovelState) -> NovelState:
         if isinstance(kpi, dict):
             previous_feedback = kpi.get("feedback", "")
 
-    # Generate prose
-    draft = writer.write_scene(
-        scene_instructions=state["scene_instructions"],
-        style=state["style"],
-        world_context=state["retrieved_context"],
-        previous_feedback=previous_feedback
-    )
+    if use_claude:
+        try:
+            writer = ClaudeWriterNode()
+            # Generate prose with refinement instructions
+            draft, refinement_instructions = writer.write_scene_with_instructions(
+                scene_instructions=state["scene_instructions"],
+                style=state["style"],
+                world_context=state["retrieved_context"],
+                previous_feedback=previous_feedback,
+                project_id=state["project_id"]
+            )
+            state["claude_draft"] = draft
+            state["refinement_instructions"] = refinement_instructions
+            console.print(f"[green]Claude draft generated ({len(draft)} characters)[/green]")
+            console.print(f"[dim]Refinement instructions: {len(refinement_instructions.get('focus_areas', []))} focus areas[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]Claude error: {e}. Falling back to Ollama.[/yellow]")
+            use_claude = False
+
+    if not use_claude:
+        # Fallback to Ollama
+        writer = WriterNode()
+        draft = writer.write_scene(
+            scene_instructions=state["scene_instructions"],
+            style=state["style"],
+            world_context=state["retrieved_context"],
+            previous_feedback=previous_feedback,
+            project_id=state["project_id"]
+        )
+        state["refinement_instructions"] = None
+        console.print(f"[green]Ollama draft generated ({len(draft)} characters)[/green]")
 
     state["draft_content"] = draft
     state["iteration_count"] = iteration
 
-    console.print(f"[green]Draft generated ({len(draft)} characters)[/green]")
+    return state
+
+
+def refiner_node(state: NovelState) -> NovelState:
+    """Refine the draft using local AI based on Claude's instructions"""
+    # Skip if no refinement instructions or not using Claude workflow
+    if not state.get("refinement_instructions"):
+        console.print("[dim]No refinement instructions. Skipping refinement.[/dim]")
+        return state
+
+    console.print("\n[bold yellow]Refining prose with local AI...[/bold yellow]")
+
+    refiner = RefinerNode()
+
+    # Use claude_draft as source
+    original_draft = state.get("claude_draft") or state.get("draft_content", "")
+
+    if not original_draft:
+        console.print("[yellow]No draft to refine.[/yellow]")
+        return state
+
+    # Refine the prose
+    refined_content = refiner.refine_prose(
+        original_draft=original_draft,
+        refinement_instructions=state.get("refinement_instructions", {}),
+        style=state.get("style", "modern_thai"),
+        world_context=state.get("retrieved_context", "")
+    )
+
+    state["draft_content"] = refined_content
+    console.print(f"[green]Refined draft ({len(refined_content)} characters)[/green]")
 
     return state
 
@@ -236,11 +300,27 @@ def save_node(state: NovelState) -> NovelState:
 
     console.print(f"[green]Chapter {state['current_chapter']} saved successfully![/green]")
 
+    # Auto-collect few-shot example if high quality
+    auto_collect_threshold = float(os.getenv("FEW_SHOT_AUTO_COLLECT_THRESHOLD", "8.0"))
+    if final_score >= auto_collect_threshold:
+        try:
+            example_id = db.auto_collect_few_shot_example(
+                project_id=state["project_id"],
+                chapter_number=state["current_chapter"],
+                min_quality_threshold=auto_collect_threshold
+            )
+            if example_id:
+                console.print(f"[cyan]✓ Auto-collected few-shot example (ID: {example_id}, score: {final_score:.1f}/10)[/cyan]")
+        except Exception as e:
+            console.print(f"[yellow]Failed to auto-collect example: {e}[/yellow]")
+
     # Move to next chapter or complete
     if state["current_chapter"] < state["total_chapters"]:
         state["current_chapter"] += 1
         state["iteration_count"] = 0
         state["draft_content"] = ""
+        state["claude_draft"] = ""
+        state["refinement_instructions"] = None
         state["kpi_report"] = None
         state["should_continue"] = True
     else:
@@ -291,13 +371,14 @@ def should_continue(state: NovelState) -> Literal["planner", "end"]:
 # ===========================================
 
 def build_workflow() -> StateGraph:
-    """Build the LangGraph workflow"""
+    """Build the LangGraph workflow with hybrid Claude/Ollama support"""
     workflow = StateGraph(NovelState)
 
     # Add nodes
     workflow.add_node("initialize", initialize_node)
     workflow.add_node("planner", planner_node)
     workflow.add_node("writer", writer_node)
+    workflow.add_node("refiner", refiner_node)
     workflow.add_node("evaluator", evaluator_node)
     workflow.add_node("save", save_node)
 
@@ -305,9 +386,11 @@ def build_workflow() -> StateGraph:
     workflow.set_entry_point("initialize")
 
     # Add edges
+    # Flow: initialize → planner → writer → refiner → evaluator
     workflow.add_edge("initialize", "planner")
     workflow.add_edge("planner", "writer")
-    workflow.add_edge("writer", "evaluator")
+    workflow.add_edge("writer", "refiner")
+    workflow.add_edge("refiner", "evaluator")
 
     # Conditional edges
     workflow.add_conditional_edges(
@@ -387,14 +470,17 @@ def generate(
         help="Writing style: ancient_chinese, thai_period, modern_thai"
     ),
     chapters: int = typer.Option(1, "--chapters", "-c", help="Number of chapters"),
-    max_iterations: int = typer.Option(3, "--max-iter", "-m", help="Max rewrites per chapter")
+    max_iterations: int = typer.Option(3, "--max-iter", "-m", help="Max rewrites per chapter"),
+    use_claude: bool = typer.Option(True, "--claude/--no-claude", help="Use Claude API for writing")
 ):
     """Generate a Thai novel"""
+    writer_info = "[cyan]Claude + Local AI[/cyan]" if use_claude else "[yellow]Local AI only[/yellow]"
     console.print(Panel.fit(
         f"[bold]AI Novelist Orchestrator[/bold]\n\n"
         f"Title: {title}\n"
         f"Style: {STYLE_GUIDES.get(style, {}).get('name', style)}\n"
-        f"Chapters: {chapters}",
+        f"Chapters: {chapters}\n"
+        f"Writer: {writer_info}",
         title="Starting Novel Generation"
     ))
 
@@ -404,7 +490,8 @@ def generate(
         plot_summary=plot,
         style=style,
         total_chapters=chapters,
-        max_iterations=max_iterations
+        max_iterations=max_iterations,
+        use_claude=use_claude
     )
 
     # Build and run workflow
@@ -648,7 +735,8 @@ def project_status(
 def write_episode(
     project_id: int = typer.Option(..., "--project", "-p", help="Project ID"),
     episode: int = typer.Option(None, "--episode", "-e", help="Episode number (auto-selects next if not provided)"),
-    max_iterations: int = typer.Option(3, "--max-iter", "-m", help="Max rewrites per episode")
+    max_iterations: int = typer.Option(3, "--max-iter", "-m", help="Max rewrites per episode"),
+    use_claude: bool = typer.Option(True, "--claude/--no-claude", help="Use Claude API for writing")
 ):
     """Write a single episode using its blueprint"""
     db = DatabaseNode()
@@ -674,11 +762,13 @@ def write_episode(
         console.print(f"[red]No blueprint found for episode {episode}[/red]")
         return
 
+    writer_info = "[cyan]Claude + Local AI[/cyan]" if use_claude else "[yellow]Local AI only[/yellow]"
     console.print(Panel.fit(
         f"[bold]Writing Episode {episode}[/bold]\n\n"
         f"Title: {blueprint['title']}\n"
         f"Tone: {blueprint['tone']}\n"
-        f"Intimacy: {blueprint['intimacy_level']}",
+        f"Intimacy: {blueprint['intimacy_level']}\n"
+        f"Writer: {writer_info}",
         title="Episode Generation"
     ))
 
@@ -688,7 +778,8 @@ def write_episode(
         plot_summary=project['plot_summary'] or "",
         style=project['style'],
         total_chapters=1,  # Single episode
-        max_iterations=max_iterations
+        max_iterations=max_iterations,
+        use_claude=use_claude
     )
     state["project_id"] = project_id
     state["current_chapter"] = episode
@@ -721,7 +812,8 @@ def write_all(
     project_id: int = typer.Option(..., "--project", "-p", help="Project ID"),
     start_episode: int = typer.Option(1, "--start", "-s", help="Starting episode number"),
     end_episode: int = typer.Option(None, "--end", "-e", help="Ending episode number (all if not specified)"),
-    max_iterations: int = typer.Option(3, "--max-iter", "-m", help="Max rewrites per episode")
+    max_iterations: int = typer.Option(3, "--max-iter", "-m", help="Max rewrites per episode"),
+    use_claude: bool = typer.Option(True, "--claude/--no-claude", help="Use Claude API for writing")
 ):
     """Write multiple episodes sequentially"""
     db = DatabaseNode()
@@ -747,10 +839,12 @@ def write_all(
         if start_episode <= bp['episode_number'] <= end_episode
     ]
 
+    writer_info = "[cyan]Claude + Local AI[/cyan]" if use_claude else "[yellow]Local AI only[/yellow]"
     console.print(Panel.fit(
         f"[bold]{project['title']}[/bold]\n\n"
         f"Episodes: {start_episode} to {end_episode}\n"
-        f"Total: {len(episodes_to_write)} episodes",
+        f"Total: {len(episodes_to_write)} episodes\n"
+        f"Writer: {writer_info}",
         title="Batch Generation"
     ))
 
@@ -770,7 +864,8 @@ def write_all(
             plot_summary=project['plot_summary'] or "",
             style=project['style'],
             total_chapters=1,
-            max_iterations=max_iterations
+            max_iterations=max_iterations,
+            use_claude=use_claude
         )
         state["project_id"] = project_id
         state["current_chapter"] = ep_num

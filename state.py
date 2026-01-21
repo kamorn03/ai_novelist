@@ -31,6 +31,14 @@ class CharacterProfile(BaseModel):
     relationships: dict = Field(default_factory=dict)  # e.g., {"character_b": "พี่ชาย"}
 
 
+class RefinementInstructions(BaseModel):
+    """Structured refinement instructions from Claude"""
+    focus_areas: List[str] = Field(default_factory=list, description="Areas that need attention")
+    style_adjustments: List[str] = Field(default_factory=list, description="Style-related improvements")
+    specific_fixes: List[str] = Field(default_factory=list, description="Specific things to fix")
+    enhancement_suggestions: List[str] = Field(default_factory=list, description="Optional enhancements")
+
+
 class NovelState(TypedDict):
     """
     Main state for the LangGraph workflow
@@ -51,7 +59,9 @@ class NovelState(TypedDict):
     scene_instructions: str  # English scene beats
 
     # Writing (Writer Node output)
-    draft_content: str  # Thai prose
+    draft_content: str  # Thai prose (final content after refinement)
+    claude_draft: str  # Original Claude draft (for training data)
+    refinement_instructions: Optional[dict]  # Claude's instructions for local AI
 
     # Evaluation (Evaluator Node output)
     kpi_report: Optional[dict]  # Serialized KPIReport
@@ -59,6 +69,7 @@ class NovelState(TypedDict):
     # Iteration Control
     iteration_count: int
     max_iterations: int
+    use_claude: bool  # Whether to use Claude for this iteration
 
     # Context from RAG
     retrieved_context: str  # Character/world info for current scene
@@ -74,7 +85,8 @@ def create_initial_state(
     plot_summary: str,
     style: str = "modern_thai",
     total_chapters: int = 1,
-    max_iterations: int = 3
+    max_iterations: int = 3,
+    use_claude: bool = True
 ) -> NovelState:
     """
     Create initial state for a new novel project
@@ -85,6 +97,7 @@ def create_initial_state(
         style: Writing style ('ancient_chinese', 'thai_period', 'modern_thai')
         total_chapters: Number of chapters to generate
         max_iterations: Max rewrites per chapter
+        use_claude: Whether to use Claude API for writing
 
     Returns:
         Initialized NovelState
@@ -98,9 +111,12 @@ def create_initial_state(
         total_chapters=total_chapters,
         scene_instructions="",
         draft_content="",
+        claude_draft="",
+        refinement_instructions=None,
         kpi_report=None,
         iteration_count=0,
         max_iterations=max_iterations,
+        use_claude=use_claude,
         retrieved_context="",
         should_continue=True,
         is_complete=False,

@@ -3,7 +3,7 @@ Planner Node - Scene planning and instruction generation
 Processes plot into detailed English scene beats
 """
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
@@ -34,14 +34,14 @@ class PlannerNode:
         )
 
         self.prompt_template = ChatPromptTemplate.from_messages([
-            ("system", self._get_system_prompt()),
+            ("system", "{system_prompt}"),
             ("human", "{input}")
         ])
 
         self.chain = self.prompt_template | self.llm | StrOutputParser()
 
-    def _get_system_prompt(self) -> str:
-        return """You are a professional Thai novel plot architect and scene planner.
+    def _get_system_prompt(self, few_shot_examples: Optional[List[Dict]] = None) -> str:
+        base_prompt = """You are a professional Thai novel plot architect and scene planner.
 
 Your role is to create detailed, actionable scene instructions in English that will guide a creative writer to produce high-quality Thai prose.
 
@@ -92,9 +92,28 @@ For each scene in the episode, provide:
 
 8. **Cliffhanger Setup**:
    - How to build tension toward the cliffhanger
-   - Exact ending moment
+   - Exact ending moment"""
 
-Be specific and detailed. The writer will use these instructions to create prose in Thai."""
+        # Add few-shot examples if provided
+        if few_shot_examples:
+            base_prompt += "\n\n## EXCELLENT EXAMPLES\n"
+            base_prompt += "Study these examples of high-quality scene planning:\n\n"
+
+            for i, example in enumerate(few_shot_examples, 1):
+                # Truncate examples to keep prompt manageable
+                input_preview = example['input_context'][:300]
+                output_preview = example['output_example'][:500]
+
+                base_prompt += f"### Example {i}\n"
+                base_prompt += f"**Blueprint/Input:**\n{input_preview}...\n\n"
+                base_prompt += f"**Detailed Instructions Output:**\n{output_preview}...\n\n"
+                base_prompt += f"(Quality Score: {example['quality_score']:.1f}/10)\n\n"
+
+            base_prompt += "Your instructions should match or exceed this level of detail.\n"
+
+        base_prompt += "\n\nBe specific and detailed. The writer will use these instructions to create prose in Thai."
+
+        return base_prompt
 
     def plan_scene(
         self,
@@ -139,7 +158,11 @@ Based on the above information, create comprehensive scene instructions for Chap
 Consider the pacing: {"This is the opening - establish the world and hook the reader." if chapter_number == 1 else "Build on previous events." if chapter_number < total_chapters else "This is the finale - bring resolution and emotional payoff."}
 """
 
-        result = self.chain.invoke({"input": input_text})
+        system_prompt = self._get_system_prompt()
+        result = self.chain.invoke({
+            "system_prompt": system_prompt,
+            "input": input_text
+        })
         return result
 
     def _get_style_description(self, style: str) -> str:
@@ -177,20 +200,44 @@ Style: Modern Thai (ไทยสมัยใหม่)
         blueprint: dict,
         characters: list,
         previous_context: str = "",
-        style: str = "modern_thai"
+        style: str = "modern_thai",
+        project_id: Optional[int] = None,
+        use_few_shot: bool = True
     ) -> str:
         """
-        Generate scene instructions from episode blueprint
+        Generate scene instructions from episode blueprint with optional few-shot learning
 
         Args:
             blueprint: Episode blueprint dict from database
             characters: List of character info dicts
             previous_context: Summary of previous episodes
             style: Writing style
+            project_id: Project ID for fetching relevant examples
+            use_few_shot: Whether to use few-shot examples (default: True)
 
         Returns:
             Detailed English scene instructions
         """
+        # Fetch few-shot examples if enabled
+        few_shot_examples = []
+        if use_few_shot and project_id and os.getenv("FEW_SHOT_ENABLED", "true").lower() == "true":
+            try:
+                from nodes.database import DatabaseNode
+                db = DatabaseNode()
+                # Use scene structure for semantic search
+                query_context = blueprint.get('scene_structure', '')
+                few_shot_examples = db.get_few_shot_examples(
+                    example_type='planner',
+                    style=style,
+                    query_context=query_context,
+                    limit=int(os.getenv("FEW_SHOT_MAX_EXAMPLES_PER_PROMPT", "2")),
+                    min_quality=float(os.getenv("FEW_SHOT_MIN_QUALITY", "8.0"))
+                )
+                if few_shot_examples:
+                    print(f"[Planner] Using {len(few_shot_examples)} few-shot examples")
+            except Exception as e:
+                print(f"[Planner] Failed to fetch few-shot examples: {e}")
+
         # Format characters info
         char_info = ""
         if characters:
@@ -242,7 +289,11 @@ IMPORTANT:
 5. Make sure the selling points are featured prominently
 """
 
-        result = self.chain.invoke({"input": input_text})
+        system_prompt = self._get_system_prompt(few_shot_examples)
+        result = self.chain.invoke({
+            "system_prompt": system_prompt,
+            "input": input_text
+        })
         return result
 
     def _get_intimacy_guidelines(self, level: str) -> str:
@@ -314,7 +365,11 @@ Focus on:
 
 Keep the core story the same, but adjust the execution guidance."""
 
-        result = self.chain.invoke({"input": refine_prompt})
+        system_prompt = self._get_system_prompt()
+        result = self.chain.invoke({
+            "system_prompt": system_prompt,
+            "input": refine_prompt
+        })
         return result
 
 
